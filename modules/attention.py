@@ -33,9 +33,24 @@ class CausalSelfAttention(nn.Module):
     return proj
 
   def attention(self, key, query, value, attention_mask):
+    d_k = query.size(-1)
+    # scores: [bs, num_heads, seq_len, seq_len]
+    scores = torch.matmul(query, key.transpose(-2, -1)) / (d_k ** 0.5)
 
-    ### 완성시켜야 할 빈 코드 블록
-    raise NotImplementedError
+    # 인과적 마스크: 위치 i는 j > i인 미래 토큰에 접근 불가
+    seq_len = query.size(2)
+    causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=query.device))
+    scores = scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0) == 0, float('-inf'))
+
+    # 패딩 마스크 적용 (패딩 위치는 큰 음수값)
+    scores = scores + attention_mask
+
+    attn_weights = torch.softmax(scores, dim=-1)
+    attn_weights = self.dropout(attn_weights)
+
+    # [bs, num_heads, seq_len, head_size] -> [bs, seq_len, hidden_size]
+    context = torch.matmul(attn_weights, value)
+    return rearrange(context, 'b h t d -> b t (h d)')
 
 
   def forward(self, hidden_states, attention_mask):
