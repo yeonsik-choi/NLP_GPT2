@@ -47,19 +47,15 @@ class GPT2Model(GPTPreTrainedModel):
     input_shape = input_ids.size()
     seq_length = input_shape[1]
 
-    inputs_embeds = None
-
-    ### 완성시켜야 할 빈 코드 블록
-    raise NotImplementedError
-
+    # 토큰 ID를 단어 임베딩으로 변환.
+    inputs_embeds = self.word_embedding(input_ids)
 
     pos_ids = self.position_ids[:, :seq_length]
-    pos_embeds = None
 
-    ### TODO: pos_ids를 사용하여 self.pos_embedding에서 위치 임베딩을 가져와 pos_embeds에 저장한다.
-    ###       그런 다음, 두 개의 임베딩을 더하고, 드롭아웃을 적용한 뒤 반환한다.
-    ### 완성시켜야 할 빈 코드 블록
-    raise NotImplementedError
+    # 위치 임베딩을 가져온 뒤, 단어 임베딩과 더하고 드롭아웃을 적용하여 반환.
+    pos_embeds = self.pos_embedding(pos_ids)
+    embeds = inputs_embeds + pos_embeds
+    return self.embed_dropout(embeds)
 
 
   def encode(self, hidden_states, attention_mask):
@@ -106,8 +102,8 @@ class GPT2Model(GPTPreTrainedModel):
 
       return hidden_state(s) * E^T
     """
-    ### 완성시켜야 할 빈 코드 블록
-    raise NotImplementedError
+    # Weight tying: 단어 임베딩 가중치(E)의 전치와 내적하여 로짓을 계산.
+    return hidden_state @ self.word_embedding.weight.T
 
 
   @classmethod
