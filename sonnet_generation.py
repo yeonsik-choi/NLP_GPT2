@@ -60,8 +60,11 @@ class SonnetGPT(nn.Module):
     ParaphraseGPT의 forward pass와 유사하지만, 여기서는 시퀀스의 마지막 토큰뿐만 아니라 시퀀스의 각 토큰에 대한 logit을 생성하려고 한다.
     이를 통해, 마지막 토큰에 대한 다음 토큰의 분포만 학습하는 것이 아니라, 모델은 소네트를 구성하는 자연어 분포를 학습할 수 있다.
     """
-    ### 완성시켜야 할 빈 코드 블록
-    raise NotImplementedError
+    # 시퀀스의 각 토큰에 대한 contextualized embedding.
+    hidden_states = self.gpt(input_ids, attention_mask)['last_hidden_state']
+    # weight tying을 통해 각 위치에서 전체 vocab에 대한 logit을 계산. [bs, seq_len, vocab].
+    logits = self.gpt.hidden_state_to_token(hidden_states)
+    return logits
 
 
   def get_device(self):
@@ -69,33 +72,53 @@ class SonnetGPT(nn.Module):
       return param.device
 
   @torch.no_grad()
-  def generate(self, encoding, temperature=0.7, top_p=0.9, max_length=128):
+  def generate(self, encoding, temperature=0.7, top_p=0.9, top_k=0, max_length=128,
+               repetition_penalty=1.0):
     """
-    top-p sampling 과 softmax temperature를 사용하여 새로운 소넷을 생성한다.
+    temperature scaling과 함께 top-k / top-p(nucleus) 샘플링으로 새로운 소넷을 생성한다.
 
-    TODO: 지금 이 방법은 기대 이하일 수 있다. 영감을 얻기 위해 Hugging Face의 model.generate(...) 함수를 참고해도 좋겠다.
-        여러 시퀀스를 생성하고 beam search를 통해 최적의 시퀀스를 선택하는 것도 좋은 한 가지 방법이다.
-        Top-k 샘플링 역시 또 다른 방법이며, 그 외에도 많은 접근법이 있다.
+    PART-II 확장: 기존에는 top-p만 지원했으나, top_k 인자를 추가해 두 필터를 함께 적용할 수 있게 했다.
+      - top_k=1   → greedy decoding (항상 argmax)
+      - top_k>1   → 상위 k개 토큰으로 후보 제한
+      - top_p<1.0 → 누적확률 p 이내의 nucleus로 후보 제한
+    추가 확장: repetition_penalty(>1.0) 로 이미 생성된 토큰의 logit을 감쇠시켜 반복/퇴화를 억제한다
+      [Keskar et al., 2019, CTRL]. chrF에 대한 효과를 sonnet_decode_experiment.py 에서 비교한다.
     """
     token_ids = encoding.to(self.get_device())
     attention_mask = torch.ones(token_ids.shape, dtype=torch.int64).to(self.get_device())
 
-
     for _ in range(max_length):
       # logits을 구하기 위한 forward pass.
       logits_sequence = self.forward(token_ids, attention_mask)
-      logits_last_token = logits_sequence[:, -1, :] / temperature  # Apply temperature scaling
+      logits_last_token = logits_sequence[:, -1, :].clone()
 
-      # Convert logits to probabilities
-      probs = torch.nn.functional.softmax(logits_last_token, dim=-1)
+      # Repetition penalty: 이미 등장한 토큰의 logit을 감쇠 (양수는 나누고 음수는 곱한다).
+      if repetition_penalty != 1.0:
+        for prev in set(token_ids[0].tolist()):
+          if logits_last_token[0, prev] > 0:
+            logits_last_token[0, prev] /= repetition_penalty
+          else:
+            logits_last_token[0, prev] *= repetition_penalty
 
-      # Top-p (nucleus) sampling
-      sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-      cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-      top_p_mask = cumulative_probs <= top_p
-      top_p_mask[..., 1:] = top_p_mask[..., :-1].clone()  # Shift mask right for proper thresholding
-      top_p_mask[..., 0] = True  # Always include the highest probability token
-      filtered_probs = sorted_probs * top_p_mask  # Zero out unlikely tokens
+      logits_last_token = logits_last_token / temperature  # Apply temperature scaling
+
+      # 내림차순 정렬 후 top-k / top-p 필터를 차례로 적용.
+      sorted_logits, sorted_indices = torch.sort(logits_last_token, descending=True)
+      sorted_probs = torch.nn.functional.softmax(sorted_logits, dim=-1)
+
+      keep = torch.ones_like(sorted_probs, dtype=torch.bool)
+      # Top-k: 상위 k개만 유지.
+      if top_k > 0:
+        keep[..., top_k:] = False
+      # Top-p (nucleus): 누적확률이 p를 넘는 토큰 제거(최상위 토큰은 항상 유지).
+      if top_p < 1.0:
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        top_p_mask = cumulative_probs <= top_p
+        top_p_mask[..., 1:] = top_p_mask[..., :-1].clone()
+        top_p_mask[..., 0] = True
+        keep = keep & top_p_mask
+
+      filtered_probs = sorted_probs * keep
       filtered_probs /= filtered_probs.sum(dim=-1, keepdim=True)  # Normalize probabilities
 
       # Sample from filtered distribution
@@ -115,6 +138,47 @@ class SonnetGPT(nn.Module):
     generated_output = self.tokenizer.decode(token_ids[0].cpu().numpy().tolist())[3:]
     return token_ids, generated_output
 
+  @torch.no_grad()
+  def generate_beam(self, encoding, beam_size=5, max_length=128, length_penalty=1.0):
+    """결정론적 beam search 디코딩 (확률적 샘플링과의 chrF 비교용, PART-II 확장).
+
+    각 step마다 살아있는 beam을 vocab 전체로 확장해 누적 log-prob 상위 beam_size개만 유지한다.
+    EOS에 도달한 beam은 고정하고, 길이 정규화(score / len^length_penalty)로 최종 beam을 고른다.
+    beam_size=1 이면 greedy와 동일하다.
+    """
+    device = self.get_device()
+    eos = self.tokenizer.eos_token_id
+    seq = encoding.to(device)                                  # [1, L]
+    beams = seq.repeat(beam_size, 1)                           # [B, L]
+    scores = torch.full((beam_size,), -1e9, device=device)
+    scores[0] = 0.0                                            # 시작 시 첫 beam만 활성(중복 방지).
+    gen_len = torch.zeros(beam_size, device=device)
+    done = torch.zeros(beam_size, dtype=torch.bool, device=device)
+
+    for _ in range(max_length):
+      mask = torch.ones_like(beams)
+      logits = self.forward(beams, mask)[:, -1, :]            # [B, V]
+      logp = torch.log_softmax(logits, dim=-1)
+      vocab = logp.size(-1)
+      # 이미 끝난 beam은 EOS만 점수 변화 없이 이어 붙인다.
+      logp[done] = -1e9
+      logp[done, eos] = 0.0
+      live_before = ~done
+      cand = (scores.unsqueeze(1) + logp).view(-1)            # [B*V]
+      top_scores, top_idx = cand.topk(beam_size)
+      beam_id = top_idx // vocab
+      tok_id = top_idx % vocab
+      beams = torch.cat([beams[beam_id], tok_id.unsqueeze(1)], dim=1)
+      scores = top_scores
+      gen_len = gen_len[beam_id] + live_before[beam_id].float()
+      done = done[beam_id] | (tok_id == eos)
+      if done.all():
+        break
+
+    final = scores / gen_len.clamp(min=1).pow(length_penalty)
+    best = beams[final.argmax()]                              # [seq]
+    return best
+
 
 def save_model(model, optimizer, args, filepath):
   save_info = {
@@ -131,8 +195,8 @@ def save_model(model, optimizer, args, filepath):
 
 
 def train(args):
-  """Sonnet 데이터셋에서 소넷 생성을 위해 GPT-2 훈련.""" 
-    device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
+  """Sonnet 데이터셋에서 소넷 생성을 위해 GPT-2 훈련."""
+  device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
   # 데이터, 해당 데이터셋 및 데이터로드 생성하기.
   sonnet_dataset = SonnetsDataset(args.sonnet_path)
   sonnet_dataloader = DataLoader(sonnet_dataset, shuffle=True, batch_size=args.batch_size,
@@ -208,7 +272,7 @@ def generate_submission_sonnets(args):
 
     print(f'{decoded_output}\n\n')
 
-  with open(args.sonnet_out, "w+") as f:
+  with open(args.sonnet_out, "w+", encoding='utf-8') as f:
     f.write(f"--Generated Sonnets-- \n\n")
     for sonnet in generated_sonnets:
       f.write(f"\n{sonnet[0]}\n")

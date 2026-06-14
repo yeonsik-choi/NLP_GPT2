@@ -29,6 +29,7 @@ from datasets import (
 )
 from evaluation import model_eval_paraphrase, model_test_paraphrase
 from models.gpt2 import GPT2Model
+from lora import inject_lora
 
 from optimizer import AdamW
 
@@ -53,9 +54,21 @@ class ParaphraseGPT(nn.Module):
     self.gpt = GPT2Model.from_pretrained(model=args.model_size, d=args.d, l=args.l, num_heads=args.num_heads)
     self.paraphrase_detection_head = nn.Linear(args.d, 2)  # Paraphrase detection 의 출력은 두 가지: 1 (yes) or 0 (no).
 
-    # 기본적으로, 전체 모델을 finetuning 한다.
-    for param in self.gpt.parameters():
-      param.requires_grad = True
+    if getattr(args, 'use_lora', False):
+      # PART-II 확장: LoRA(PEFT). 사전학습 가중치는 동결하고 저랭크 보정항만 학습한다.
+      for param in self.gpt.parameters():
+        param.requires_grad = False
+      targets = tuple(t.strip() for t in getattr(args, 'lora_targets', 'query,value').split(',') if t.strip())
+      dropout = getattr(args, 'lora_dropout', 0.0)
+      n_mod, trainable, total = inject_lora(self.gpt, rank=args.lora_rank, alpha=args.lora_alpha,
+                                            targets=targets, dropout=dropout)
+      print(f"[LoRA] rank={args.lora_rank} alpha={args.lora_alpha} targets={targets} dropout={dropout} | "
+            f"적용 모듈 {n_mod}개 | 학습 파라미터 {trainable:,} / {total:,} "
+            f"({100 * trainable / total:.3f}%)")
+    else:
+      # 기본적으로, 전체 모델을 finetuning 한다.
+      for param in self.gpt.parameters():
+        param.requires_grad = True
 
   def forward(self, input_ids, attention_mask):
     """
@@ -65,12 +78,20 @@ class ParaphraseGPT(nn.Module):
 
       'Is "{s1}" a paraphrase of "{s2}"? Answer "yes" or "no": '
 
-    따라서, 문장의 끝에서 다음 토큰에 대한 예측을 해야 할 것이다. 
-    훈련이 잘 되었다면, 패러프레이즈인 경우에는 토큰 "yes"(BPE index 8505)가, 
+    따라서, 문장의 끝에서 다음 토큰에 대한 예측을 해야 할 것이다.
+    훈련이 잘 되었다면, 패러프레이즈인 경우에는 토큰 "yes"(BPE index 8505)가,
     패러프레이즈가 아닌 경우에는 토큰 "no" (BPE index 3919)가 될 것이다.
+
+    이 데이터 파이프라인(collate_fn)은 레이블을 'yes'/'no'의 BPE 토큰 id(8505/3919)로
+    제공하고, 평가(model_eval_paraphrase)는 logits의 argmax를 그 토큰 id와 직접 비교한다.
+    따라서 forward는 마지막 토큰의 hidden state로부터 전체 vocab에 대한 logit을 반환한다
+    (가중치 공유 = weight tying). 2-class head 대신 cloze 방식을 사용하는 이유다.
     """
-    ### 완성시켜야 할 빈 코드 블록
-    raise NotImplementedError
+    # 마지막(non-padding) 토큰의 contextualized embedding.
+    last_token = self.gpt(input_ids, attention_mask)['last_token']
+    # weight tying을 통해 전체 vocab에 대한 logit을 계산. argmax → BPE token id.
+    logits = self.gpt.hidden_state_to_token(last_token)
+    return logits
 
 
 
@@ -91,6 +112,9 @@ def save_model(model, optimizer, args, filepath):
 def train(args):
   """Quora 데이터셋에서 Paraphrase Detection을 위한 GPT-2 훈련."""
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
+  if args.use_gpu and torch.cuda.is_available():
+    # 다른 프로세스가 점유한 8GB GPU에서 WDDM RAM spill(~20배 저하)을 막기 위한 상한.
+    torch.cuda.set_per_process_memory_fraction(0.80)
   # 데이터, 해당 데이터셋 및 데이터로드 생성하기.
   para_train_data = load_paraphrase_data(args.para_train)
   para_dev_data = load_paraphrase_data(args.para_dev)
@@ -201,6 +225,14 @@ def get_args():
                       help="The model size as specified on hugging face. DO NOT use the xl model.",
                       choices=['gpt2', 'gpt2-medium', 'gpt2-large'], default='gpt2')
 
+  # PART-II 확장: LoRA(PEFT) 옵션. 미지정 시 기존 full fine-tuning 동작 유지.
+  parser.add_argument("--use_lora", action='store_true', help="LoRA로 파라미터 효율적 미세조정 수행")
+  parser.add_argument("--lora_rank", type=int, default=8)
+  parser.add_argument("--lora_alpha", type=int, default=16)
+  parser.add_argument("--lora_targets", type=str, default="query,value",
+                      help="LoRA 주입 대상(쉼표 구분): query,key,value,attn_out,mlp 중 선택")
+  parser.add_argument("--lora_dropout", type=float, default=0.0)
+
   args = parser.parse_args()
   return args
 
@@ -226,7 +258,8 @@ def add_arguments(args):
 
 if __name__ == "__main__":
   args = get_args()
-  args.filepath = f'{args.epochs}-{args.lr}-paraphrase.pt'  # 경로명 저장.
+  tag = f'lora{args.lora_rank}' if args.use_lora else 'full'
+  args.filepath = f'{args.epochs}-{args.lr}-{tag}-paraphrase.pt'  # 경로명 저장.
   seed_everything(args.seed)  # 재현성을 위한 random seed 고정.
   train(args)
   test(args)
